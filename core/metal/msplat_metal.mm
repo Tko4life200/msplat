@@ -11,6 +11,32 @@
 #import <unordered_map>
 #import <functional>
 #import <array>
+#import <mutex>
+#import <mach/mach_time.h>
+
+// GPU profiling infrastructure.
+// PROFILE_GPU=1: per-CB total GPU time via completion handlers.
+// PROFILE_STAGES=1: per-stage GPU time via Metal timestamp counters + separate encoders.
+static bool g_gpu_timing_enabled = false;
+static bool g_gpu_timing_checked = false;
+static std::mutex g_gpu_timing_mutex;
+static std::vector<double> g_gpu_times_ms;
+
+// Per-stage profiling
+static bool g_profile_stages = false;
+static bool g_profile_stages_checked = false;
+
+// Stage names for training pipeline
+static const char* g_train_stage_names[] = {
+    "blit_zero", "proj_sh_fwd", "prefix_sort_pack", "rast_fwd",
+    "loss_fwd_bwd", "rast_bwd", "proj_sh_bwd_adam", "grad_stats"
+};
+static constexpr int N_TRAIN_STAGES = 8;
+
+static std::mutex g_stage_timing_mutex;
+// Per-stage accumulated times (ms), indexed by stage
+static std::vector<double> g_stage_times[N_TRAIN_STAGES];
+static int g_stage_report_count = 0;
 
 struct MetalContext {
     id<MTLDevice>       device;
@@ -29,6 +55,15 @@ struct MetalContext {
     }
     void commitCB() {
         if (_currentCB) {
+            if (g_gpu_timing_enabled) {
+                [_currentCB addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                    double gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+                    if (gpu_ms > 0) {
+                        std::lock_guard<std::mutex> lock(g_gpu_timing_mutex);
+                        g_gpu_times_ms.push_back(gpu_ms);
+                    }
+                }];
+            }
             [_currentCB commitAndContinue];
         }
     }
@@ -41,13 +76,63 @@ struct MetalContext {
         }
     }
 
+    // Per-stage GPU timestamp profiling (Metal counter sample buffer)
+    id<MTLCounterSampleBuffer> counterSampleBuffer;
+    bool counterSamplingAvailable = false;
+    double ticksToMs = 0.0;  // conversion factor from GPU ticks to milliseconds
+
+    void initCounterSampling() {
+        // Need 2 samples per stage (start + end)
+        NSUInteger sampleCount = N_TRAIN_STAGES * 2;
+
+        // Find timestamp counter set
+        id<MTLCounterSet> timestampSet = nil;
+        for (id<MTLCounterSet> cs in device.counterSets) {
+            if ([[cs name] isEqualToString:MTLCommonCounterSetTimestamp]) {
+                timestampSet = cs;
+                break;
+            }
+        }
+        if (!timestampSet) {
+            fprintf(stderr, "PROFILE_STAGES: MTLCommonCounterSetTimestamp not available\n");
+            return;
+        }
+
+        // Check if stage boundary sampling is supported (guaranteed on Apple Silicon)
+        if (![device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+            fprintf(stderr, "PROFILE_STAGES: AtStageBoundary sampling not supported\n");
+            return;
+        }
+
+        MTLCounterSampleBufferDescriptor *desc = [MTLCounterSampleBufferDescriptor new];
+        desc.counterSet = timestampSet;
+        desc.sampleCount = sampleCount;
+        desc.storageMode = MTLStorageModeShared;
+        desc.label = @"msplat stage profiling";
+
+        NSError *error = nil;
+        counterSampleBuffer = [device newCounterSampleBufferWithDescriptor:desc error:&error];
+        if (!counterSampleBuffer) {
+            fprintf(stderr, "PROFILE_STAGES: Failed to create counter sample buffer: %s\n",
+                    error.localizedDescription.UTF8String);
+            return;
+        }
+
+        // Compute ticks-to-ms conversion (Apple Silicon: mach_absolute_time units)
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        ticksToMs = (double)tb.numer / (double)tb.denom / 1e6;
+
+        counterSamplingAvailable = true;
+        fprintf(stderr, "PROFILE_STAGES: GPU timestamp profiling enabled (%lu sample slots)\n",
+                (unsigned long)sampleCount);
+    }
+
     // Forward pipeline kernels
     id<MTLComputePipelineState> project_and_sh_forward_kernel_cpso;
     id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso;
-    id<MTLComputePipelineState> pack_sorted_gaussians_kernel_cpso;
     // Tile-local sorting
-    id<MTLComputePipelineState> count_intersections_per_tile_kernel_cpso;
-    id<MTLComputePipelineState> scatter_to_tiles_kernel_cpso;
+    id<MTLComputePipelineState> scatter_to_prealloc_bins_kernel_cpso;
     id<MTLComputePipelineState> bitonic_sort_per_tile_kernel_cpso;
     // Prefix sum
     id<MTLComputePipelineState> prefix_sum_kernel_cpso;
@@ -62,7 +147,7 @@ struct MetalContext {
     // Separable SSIM loss kernels
     id<MTLComputePipelineState> ssim_h_fwd_kernel_cpso;
     id<MTLComputePipelineState> ssim_v_fwd_kernel_cpso;
-    id<MTLComputePipelineState> ssim_h_bwd_kernel_cpso;
+    id<MTLComputePipelineState> ssim_fused_v_fwd_h_bwd_kernel_cpso;
     id<MTLComputePipelineState> ssim_v_bwd_kernel_cpso;
     // Backward pipeline kernels
     id<MTLComputePipelineState> project_and_sh_backward_kernel_cpso;
@@ -149,10 +234,8 @@ MetalContext* init_msplat_metal_context() {
     // Forward pipeline
     ctx->project_and_sh_forward_kernel_cpso       = load(@"project_and_sh_forward_kernel");
     ctx->nd_rasterize_forward_kernel_cpso         = load(@"nd_rasterize_forward_kernel");
-    ctx->pack_sorted_gaussians_kernel_cpso        = load(@"pack_sorted_gaussians_kernel");
     // Tile-local sorting
-    ctx->count_intersections_per_tile_kernel_cpso  = load(@"count_intersections_per_tile_kernel");
-    ctx->scatter_to_tiles_kernel_cpso             = load(@"scatter_to_tiles_kernel");
+    ctx->scatter_to_prealloc_bins_kernel_cpso      = load(@"scatter_to_prealloc_bins_kernel");
     ctx->bitonic_sort_per_tile_kernel_cpso        = load(@"bitonic_sort_per_tile_kernel");
     // Prefix sum
     ctx->prefix_sum_kernel_cpso                   = load(@"prefix_sum_kernel");
@@ -167,7 +250,7 @@ MetalContext* init_msplat_metal_context() {
     // Separable SSIM loss
     ctx->ssim_h_fwd_kernel_cpso                   = load(@"ssim_h_fwd_kernel");
     ctx->ssim_v_fwd_kernel_cpso                   = load(@"ssim_v_fwd_kernel");
-    ctx->ssim_h_bwd_kernel_cpso                   = load(@"ssim_h_bwd_kernel");
+    ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso       = load(@"ssim_fused_v_fwd_h_bwd_kernel");
     ctx->ssim_v_bwd_kernel_cpso                   = load(@"ssim_v_bwd_kernel");
     // Backward pipeline
     ctx->project_and_sh_backward_kernel_cpso      = load(@"project_and_sh_backward_kernel");
@@ -182,6 +265,16 @@ MetalContext* init_msplat_metal_context() {
     ctx->compact_copy_back_kernel_cpso            = load(@"compact_copy_back_kernel");
 
     [metal_library release];
+
+    // Initialize counter sampling if PROFILE_STAGES is set
+    ctx->counterSampleBuffer = nil;
+    ctx->counterSamplingAvailable = false;
+    ctx->ticksToMs = 0.0;
+    if (std::getenv("PROFILE_STAGES")) {
+        g_profile_stages = true;
+        g_profile_stages_checked = true;
+        ctx->initCounterSampling();
+    }
 
     return ctx;
 }
@@ -213,6 +306,10 @@ MTensor gpu_empty(std::vector<int64_t> shape, DType dtype) {
 }
 
 void msplat_commit() {
+    if (!g_gpu_timing_checked) {
+        g_gpu_timing_enabled = std::getenv("PROFILE_GPU") != nullptr;
+        g_gpu_timing_checked = true;
+    }
     get_global_context()->commitCB();
 }
 
@@ -220,13 +317,30 @@ void msplat_gpu_sync() {
     get_global_context()->syncCB();
 }
 
-#define RS_TG_SIZE 256
-#define RS_RADIX 256
+void msplat_enable_gpu_timing(bool enable) {
+    g_gpu_timing_enabled = enable;
+    g_gpu_timing_checked = true;
+}
+
+void msplat_drain_gpu_times(std::vector<double>& out) {
+    std::lock_guard<std::mutex> lock(g_gpu_timing_mutex);
+    out = std::move(g_gpu_times_ms);
+    g_gpu_times_ms.clear();
+}
+
+void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages, int& n_stages,
+                              const char** stage_names) {
+    std::lock_guard<std::mutex> lock(g_stage_timing_mutex);
+    n_stages = std::min(max_stages, N_TRAIN_STAGES);
+    for (int i = 0; i < n_stages; i++) {
+        stage_times[i] = std::move(g_stage_times[i]);
+        g_stage_times[i].clear();
+        stage_names[i] = g_train_stage_names[i];
+    }
+}
+
 #define RAST_BLOCK_X 8
 #define RAST_BLOCK_Y 8
-
-static bool g_profile_stages = false;
-static bool g_profile_stages_checked = false;
 
 // Cached buffer pool — all intermediate GPU buffers are reused across iterations.
 // Sizes only change at densification (every 100 steps); between densifications
@@ -237,19 +351,16 @@ struct FusedTensorCache {
 
     // Forward intermediates
     MTensor xys, depths, radii_out, conics, num_tiles_hit, colors, aabb;
-    MTensor cum_tiles_hit;
-    MTensor isect_ids, gaussian_ids;
+    MTensor gaussian_ids;
     MTensor packed_xy_opac, packed_conic, packed_rgb;
     MTensor out_img, final_Ts, final_idx;
     MTensor loss_intermediates;
     MTensor ssim_h_buf;
     MTensor tile_bins, loss_sum;
 
-    // Sort temp buffers
-    MTensor sort_keys_tmp, sort_vals_tmp, sort_counts;
-
     // Tile-local sorting buffers
-    MTensor tile_counts, tile_offsets, tile_scatter_counters;
+    MTensor tile_offsets, tile_scatter_counters;
+    MTensor prealloc_bins;  // [num_tiles × MAX_TILE_ELEMS] uint64 — pre-allocated per-tile bins
 
     // Multi-threadgroup prefix sum temp buffer
     MTensor block_totals;
@@ -280,20 +391,14 @@ struct FusedTensorCache {
             num_tiles_hit = mtensor_empty(dev, {np}, DType::Int32);
             colors = mtensor_empty(dev, {np, 3}, DType::Float32);
             aabb = mtensor_empty(dev, {np, 2}, DType::Float32);
-            cum_tiles_hit = mtensor_empty(dev, {np}, DType::Int32);
             block_totals = mtensor_empty(dev, {(np + 1023) / 1024}, DType::Int32);
         }
         if (cap != capacity) {
             capacity = cap;
-            isect_ids = mtensor_empty(dev, {cap}, DType::Int64);
             gaussian_ids = mtensor_empty(dev, {cap}, DType::Int32);
             packed_xy_opac = mtensor_empty(dev, {cap, 3}, DType::Float32);
             packed_conic = mtensor_empty(dev, {cap, 3}, DType::Float32);
             packed_rgb = mtensor_empty(dev, {cap, 3}, DType::Float32);
-            int64_t rs_num_blocks = (cap + RS_TG_SIZE - 1) / RS_TG_SIZE;
-            sort_keys_tmp = mtensor_empty(dev, {cap}, DType::Int64);
-            sort_vals_tmp = mtensor_empty(dev, {cap}, DType::Int32);
-            sort_counts = mtensor_empty(dev, {rs_num_blocks * RS_RADIX}, DType::Int32);
         }
         if (ih != img_height || iw != img_width) {
             img_height = ih; img_width = iw;
@@ -307,9 +412,9 @@ struct FusedTensorCache {
         if (nt != num_tiles) {
             num_tiles = nt;
             tile_bins = mtensor_empty(dev, {nt, 2}, DType::Int32);
-            tile_counts = mtensor_empty(dev, {nt}, DType::Int32);
             tile_offsets = mtensor_empty(dev, {nt}, DType::Int32);
             tile_scatter_counters = mtensor_empty(dev, {nt}, DType::Int32);
+            prealloc_bins = mtensor_empty(dev, {(int64_t)nt * 2048}, DType::Int64);
         }
         if (!loss_sum.defined()) {
             loss_sum = mtensor_empty(dev, {1}, DType::Float32);
@@ -371,24 +476,20 @@ static void forward_pipeline(
     int tile_bounds_y = std::get<1>(tile_bounds);
     int num_tiles = tile_bounds_x * tile_bounds_y;
 
-    // --- Overflow check: check every 100 iters and after densification ---
-    // Checking every iteration is too expensive (synchronize drains MPS pipeline).
-    // Checking too rarely risks stale sort data causing GPU hangs.
+    // --- Overflow check: detect per-tile overflow (> 2048 gaussians in a tile) ---
+    // Only warn once to avoid noisy output (per-tile overflow is common at >1M gaussians)
+    static bool overflow_warned = false;
     static int iter_count_oc = 0;
     iter_count_oc++;
     bool num_points_changed = (num_points != g_tcache.fwd_num_points && g_tcache.fwd_num_points > 0);
-    if (g_tcache.overflow_flag.defined() && g_tcache.fwd_num_points > 0
+    if (!overflow_warned && g_tcache.overflow_flag.defined() && g_tcache.fwd_num_points > 0
         && (num_points_changed || (iter_count_oc % 100) == 1)) {
         ctx->syncCB();
         int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
         if (flag_val > 0) {
-            int64_t actual_count = g_tcache.cum_tiles_hit.data<int32_t>()[g_tcache.fwd_num_points - 1];
-            int64_t new_mult = (actual_count * 3 / 2 + num_points - 1) / num_points;
-            g_tcache.capacity_multiplier = std::max(g_tcache.capacity_multiplier, std::max(new_mult, (int64_t)3));
-            fprintf(stderr, "WARNING: intersection overflow (actual=%lld > capacity=%lld). "
-                    "Increasing multiplier to %lldx for future iterations.\n",
-                    (long long)actual_count, (long long)g_tcache.capacity,
-                    (long long)g_tcache.capacity_multiplier);
+            fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
+                    "Some gaussians were dropped from overfull tiles.\n");
+            overflow_warned = true;
         }
     }
     int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
@@ -403,8 +504,6 @@ static void forward_pipeline(
     MTensor &num_tiles_hit = g_tcache.num_tiles_hit;
     MTensor &colors = g_tcache.colors;
     MTensor &aabb = g_tcache.aabb;
-    MTensor &cum_tiles_hit = g_tcache.cum_tiles_hit;
-    MTensor &isect_ids = g_tcache.isect_ids;
     MTensor &gaussian_ids = g_tcache.gaussian_ids;
     MTensor &tile_bins = g_tcache.tile_bins;
     MTensor &loss_sum = g_tcache.loss_sum;
@@ -476,83 +575,40 @@ static void forward_pipeline(
 
     auto encode_prefix_map = [&](id<MTLComputeCommandEncoder> enc) {
         uint32_t num_tiles_u32 = (uint32_t)num_tiles;
-        // 1. prefix_sum(num_tiles_hit -> cum_tiles_hit) — multi-threadgroup path
-        //    Pass 1: block_reduce — each of K threadgroups sums 1024 elements
+        // 1. scatter_to_prealloc_bins (replaces count_intersections + scatter_to_tiles)
         {
-            uint32_t K = (uint32_t)((num_points + 1023) / 1024);
-            [enc setComputePipelineState:ctx->block_reduce_kernel_cpso];
-            ENC_SCALAR(enc, prefix_N, 0); ENC_BUF(enc, num_tiles_hit, 1);
-            ENC_BUF(enc, g_tcache.block_totals, 2);
-            [enc dispatchThreadgroups:MTLSizeMake(K, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        //    Pass 2: block_scan_propagate — each threadgroup applies offset + local prefix sum
-        {
-            uint32_t K = (uint32_t)((num_points + 1023) / 1024);
-            [enc setComputePipelineState:ctx->block_scan_propagate_kernel_cpso];
-            ENC_SCALAR(enc, prefix_N, 0); ENC_BUF(enc, num_tiles_hit, 1);
-            ENC_BUF(enc, cum_tiles_hit, 2); ENC_BUF(enc, g_tcache.block_totals, 3);
-            [enc dispatchThreadgroups:MTLSizeMake(K, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        // 2. count_intersections_per_tile
-        {
-            NSUInteger tpg = MIN(ctx->count_intersections_per_tile_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
-            [enc setComputePipelineState:ctx->count_intersections_per_tile_kernel_cpso];
-            ENC_SCALAR(enc, num_points_u32, 0); ENC_BUF(enc, xys, 1); ENC_BUF(enc, radii_out, 2); ENC_BUF(enc, aabb, 3);
-            [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:4];
-            ENC_BUF(enc, g_tcache.tile_counts, 5);
-            [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        // 3. prefix_sum(tile_counts -> tile_offsets)
-        {
-            NSUInteger tg2 = MIN(ctx->prefix_sum_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)1024);
-            [enc setComputePipelineState:ctx->prefix_sum_kernel_cpso];
-            ENC_SCALAR(enc, num_tiles_u32, 0); ENC_BUF(enc, g_tcache.tile_counts, 1); ENC_BUF(enc, g_tcache.tile_offsets, 2);
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        // 4. scatter_to_tiles
-        {
-            NSUInteger tpg = MIN(ctx->scatter_to_tiles_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
-            [enc setComputePipelineState:ctx->scatter_to_tiles_kernel_cpso];
+            NSUInteger tpg = MIN(ctx->scatter_to_prealloc_bins_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+            [enc setComputePipelineState:ctx->scatter_to_prealloc_bins_kernel_cpso];
             ENC_SCALAR(enc, num_points_u32, 0); ENC_BUF(enc, xys, 1); ENC_BUF(enc, depths, 2);
             ENC_BUF(enc, radii_out, 3); ENC_BUF(enc, aabb, 4);
             [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:5];
-            ENC_BUF(enc, g_tcache.tile_offsets, 6); ENC_BUF(enc, g_tcache.tile_counts, 7);
-            ENC_BUF(enc, g_tcache.tile_scatter_counters, 8);
-            ENC_BUF(enc, isect_ids, 9);  // reused as sort_pairs (uint64)
-            ENC_BUF(enc, tile_bins, 10);
-            ENC_SCALAR(enc, capacity_u32, 11); ENC_BUF(enc, g_tcache.overflow_flag, 12);
-            ENC_SCALAR(enc, num_tiles_u32, 13);
+            ENC_BUF(enc, g_tcache.tile_scatter_counters, 6);
+            ENC_BUF(enc, g_tcache.prealloc_bins, 7);
+            ENC_BUF(enc, g_tcache.overflow_flag, 8);
             [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        // 5. bitonic_sort_per_tile (fused with pack: writes packed buffers inline)
+        // 2. prefix_sum(tile_scatter_counters -> tile_offsets)
+        {
+            NSUInteger tg2 = MIN(ctx->prefix_sum_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)1024);
+            [enc setComputePipelineState:ctx->prefix_sum_kernel_cpso];
+            ENC_SCALAR(enc, num_tiles_u32, 0); ENC_BUF(enc, g_tcache.tile_scatter_counters, 1); ENC_BUF(enc, g_tcache.tile_offsets, 2);
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
+        }
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        // 3. bitonic_sort_per_tile (reads prealloc_bins, writes packed + tile_bins)
         {
             [enc setComputePipelineState:ctx->bitonic_sort_per_tile_kernel_cpso];
-            ENC_BUF(enc, g_tcache.tile_offsets, 0); ENC_BUF(enc, g_tcache.tile_counts, 1);
-            ENC_BUF(enc, isect_ids, 2);  // sort_pairs (in-place)
-            ENC_BUF(enc, gaussian_ids, 3);  // output sorted gaussian IDs
+            ENC_BUF(enc, g_tcache.tile_offsets, 0); ENC_BUF(enc, g_tcache.tile_scatter_counters, 1);
+            ENC_BUF(enc, g_tcache.prealloc_bins, 2);
+            ENC_BUF(enc, gaussian_ids, 3);
             ENC_SCALAR(enc, num_tiles_u32, 4);
             ENC_BUF(enc, xys, 5); ENC_BUF(enc, conics, 6);
             ENC_BUF(enc, colors, 7); ENC_BUF(enc, opacities, 8);
             ENC_BUF(enc, packed_xy_opac, 9); ENC_BUF(enc, packed_conic, 10); ENC_BUF(enc, packed_rgb, 11);
+            ENC_BUF(enc, tile_bins, 12);
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
-    };
-
-    auto encode_pack = [&](id<MTLComputeCommandEncoder> enc) {
-        NSUInteger tpg = MIN(ctx->pack_sorted_gaussians_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)capacity);
-        [enc setComputePipelineState:ctx->pack_sorted_gaussians_kernel_cpso];
-        ENC_BUF(enc, gaussian_ids, 0);  // always gaussian_ids (no ping-pong)
-        ENC_BUF(enc, xys, 1); ENC_BUF(enc, conics, 2);
-        ENC_BUF(enc, colors, 3); ENC_BUF(enc, opacities, 4);
-        ENC_BUF(enc, packed_xy_opac, 5); ENC_BUF(enc, packed_conic, 6); ENC_BUF(enc, packed_rgb, 7);
-        ENC_SCALAR(enc, capacity_u32, 8);
-        ENC_BUF(enc, cum_tiles_hit, 9); ENC_SCALAR(enc, num_points_u32, 10);
-        [enc dispatchThreads:MTLSizeMake(capacity, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     };
 
     // K_max for chunked rasterization — set after GPU readback
@@ -659,67 +715,7 @@ static void forward_pipeline(
         g_tcache.ensure_chunks(K_max, img_height, img_width, ctx->device);
     }
 
-    if (!g_profile_stages_checked) { g_profile_stages = std::getenv("PROFILE_STAGES") != nullptr; g_profile_stages_checked = true; }
-    if (g_profile_stages) {
-        // Profiling mode: separate command buffers per stage with synchronize()
-        // This gives accurate per-stage GPU time (but total is higher due to pipeline bubbles)
-        auto stage_time = [ctx](const char* name, std::function<void()> fn) {
-            ctx->syncCB();
-            auto t0 = std::chrono::high_resolution_clock::now();
-            fn();
-            ctx->syncCB();
-            auto t1 = std::chrono::high_resolution_clock::now();
-            double ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
-            static std::unordered_map<std::string, std::vector<double>> stage_times;
-            stage_times[name].push_back(ms);
-            auto &v = stage_times[name];
-            if (v.size() % 200 == 0 && v.size() >= 200) {
-                auto sorted = v;
-                std::sort(sorted.begin(), sorted.end());
-                fprintf(stderr, "  %-20s median=%.3fms (n=%zu)\n", name, sorted[sorted.size()/2], sorted.size());
-            }
-        };
-
-        stage_time("proj_sh", [&]() {
-            id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
-            dispatch_sync(ctx->d_queue, ^(){
-                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                encode_proj_sh(enc);
-                [enc endEncoding];
-            });
-            ctx->commitCB();
-        });
-        stage_time("prefix_sort_pack", [&]() {
-            id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
-            dispatch_sync(ctx->d_queue, ^(){
-                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                encode_prefix_map(enc);
-                [enc endEncoding];
-            });
-            ctx->commitCB();
-        });
-        stage_time("rast_fwd", [&]() {
-            id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
-            dispatch_sync(ctx->d_queue, ^(){
-                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                encode_rast_fwd(enc);
-                [enc endEncoding];
-            });
-            ctx->commitCB();
-        });
-        if (compute_loss) {
-            stage_time("loss_fwd", [&]() {
-                id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
-                dispatch_sync(ctx->d_queue, ^(){
-                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                    encode_loss_fwd(enc);
-                    [enc endEncoding];
-                });
-                ctx->commitCB();
-            });
-        }
-    } else {
-        // Single encoder for all forward stages
+    {
         id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
         assert(command_buffer && "Failed to retrieve command buffer reference");
 
@@ -727,10 +723,9 @@ static void forward_pipeline(
             // Blit-zero buffers that accumulate across gaussians (must be GPU-side
             // to avoid racing with previous CB's reads on pipelined execution)
             id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
-            [blit fillBuffer:tile_bins.buffer() range:NSMakeRange(0, tile_bins.nbytes()) value:0];
+            // tile_bins written by sort kernel, tile_counts no longer used
             [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
             [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
-            [blit fillBuffer:g_tcache.tile_counts.buffer() range:NSMakeRange(0, g_tcache.tile_counts.nbytes()) value:0];
             [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
             [blit endEncoding];
 
@@ -796,24 +791,20 @@ std::tuple<MTensor, float> msplat_train_step(
     int tile_bounds_y = std::get<1>(tile_bounds);
     int num_tiles = tile_bounds_x * tile_bounds_y;
 
-    // --- Overflow check: check every 100 iters and after densification ---
-    // Checking every iteration is too expensive (synchronize drains MPS pipeline).
-    // Checking too rarely risks stale sort data causing GPU hangs.
+    // --- Overflow check: detect per-tile overflow (> 2048 gaussians in a tile) ---
+    // Only warn once to avoid noisy output (per-tile overflow is common at >1M gaussians)
+    static bool overflow_warned = false;
     static int iter_count_oc = 0;
     iter_count_oc++;
     bool num_points_changed = (num_points != g_tcache.fwd_num_points && g_tcache.fwd_num_points > 0);
-    if (g_tcache.overflow_flag.defined() && g_tcache.fwd_num_points > 0
+    if (!overflow_warned && g_tcache.overflow_flag.defined() && g_tcache.fwd_num_points > 0
         && (num_points_changed || (iter_count_oc % 100) == 1)) {
         ctx->syncCB();
         int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
         if (flag_val > 0) {
-            int64_t actual_count = g_tcache.cum_tiles_hit.data<int32_t>()[g_tcache.fwd_num_points - 1];
-            int64_t new_mult = (actual_count * 3 / 2 + num_points - 1) / num_points;
-            g_tcache.capacity_multiplier = std::max(g_tcache.capacity_multiplier, std::max(new_mult, (int64_t)3));
-            fprintf(stderr, "WARNING: intersection overflow (actual=%lld > capacity=%lld). "
-                    "Increasing multiplier to %lldx for future iterations.\n",
-                    (long long)actual_count, (long long)g_tcache.capacity,
-                    (long long)g_tcache.capacity_multiplier);
+            fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
+                    "Some gaussians were dropped from overfull tiles.\n");
+            overflow_warned = true;
         }
     }
     int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
@@ -830,8 +821,6 @@ std::tuple<MTensor, float> msplat_train_step(
     MTensor &num_tiles_hit = g_tcache.num_tiles_hit;
     MTensor &colors = g_tcache.colors;
     MTensor &aabb = g_tcache.aabb;
-    MTensor &cum_tiles_hit = g_tcache.cum_tiles_hit;
-    MTensor &isect_ids = g_tcache.isect_ids;
     MTensor &gaussian_ids = g_tcache.gaussian_ids;
     MTensor &tile_bins = g_tcache.tile_bins;
     MTensor &loss_sum = g_tcache.loss_sum;
@@ -929,69 +918,38 @@ std::tuple<MTensor, float> msplat_train_step(
 
     auto encode_prefix_map = [&](id<MTLComputeCommandEncoder> enc) {
         uint32_t num_tiles_u32 = (uint32_t)num_tiles;
-        // 1. prefix_sum (multi-threadgroup)
+        // 1. scatter_to_prealloc_bins
         {
-            uint32_t K = (uint32_t)((num_points + 1023) / 1024);
-            [enc setComputePipelineState:ctx->block_reduce_kernel_cpso];
-            ENC_SCALAR(enc, prefix_N, 0); ENC_BUF(enc, num_tiles_hit, 1);
-            ENC_BUF(enc, g_tcache.block_totals, 2);
-            [enc dispatchThreadgroups:MTLSizeMake(K, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        {
-            uint32_t K = (uint32_t)((num_points + 1023) / 1024);
-            [enc setComputePipelineState:ctx->block_scan_propagate_kernel_cpso];
-            ENC_SCALAR(enc, prefix_N, 0); ENC_BUF(enc, num_tiles_hit, 1);
-            ENC_BUF(enc, cum_tiles_hit, 2); ENC_BUF(enc, g_tcache.block_totals, 3);
-            [enc dispatchThreadgroups:MTLSizeMake(K, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        // 2. count_intersections_per_tile
-        {
-            NSUInteger tpg = MIN(ctx->count_intersections_per_tile_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
-            [enc setComputePipelineState:ctx->count_intersections_per_tile_kernel_cpso];
-            ENC_SCALAR(enc, num_points_u32, 0); ENC_BUF(enc, xys, 1); ENC_BUF(enc, radii_out, 2); ENC_BUF(enc, aabb, 3);
-            [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:4];
-            ENC_BUF(enc, g_tcache.tile_counts, 5);
-            [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        // 3. prefix_sum(tile_counts -> tile_offsets)
-        {
-            NSUInteger tg2 = MIN(ctx->prefix_sum_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)1024);
-            [enc setComputePipelineState:ctx->prefix_sum_kernel_cpso];
-            ENC_SCALAR(enc, num_tiles_u32, 0); ENC_BUF(enc, g_tcache.tile_counts, 1); ENC_BUF(enc, g_tcache.tile_offsets, 2);
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        // 4. scatter_to_tiles
-        {
-            NSUInteger tpg = MIN(ctx->scatter_to_tiles_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
-            [enc setComputePipelineState:ctx->scatter_to_tiles_kernel_cpso];
+            NSUInteger tpg = MIN(ctx->scatter_to_prealloc_bins_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+            [enc setComputePipelineState:ctx->scatter_to_prealloc_bins_kernel_cpso];
             ENC_SCALAR(enc, num_points_u32, 0); ENC_BUF(enc, xys, 1); ENC_BUF(enc, depths, 2);
             ENC_BUF(enc, radii_out, 3); ENC_BUF(enc, aabb, 4);
             [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:5];
-            ENC_BUF(enc, g_tcache.tile_offsets, 6); ENC_BUF(enc, g_tcache.tile_counts, 7);
-            ENC_BUF(enc, g_tcache.tile_scatter_counters, 8);
-            ENC_BUF(enc, isect_ids, 9);
-            ENC_BUF(enc, tile_bins, 10);
-            ENC_SCALAR(enc, capacity_u32, 11); ENC_BUF(enc, g_tcache.overflow_flag, 12);
-            uint32_t num_tiles_u32_local = (uint32_t)num_tiles;
-            ENC_SCALAR(enc, num_tiles_u32_local, 13);
+            ENC_BUF(enc, g_tcache.tile_scatter_counters, 6);
+            ENC_BUF(enc, g_tcache.prealloc_bins, 7);
+            ENC_BUF(enc, g_tcache.overflow_flag, 8);
             [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        // 5. bitonic_sort_per_tile (fused with pack)
+        // 2. prefix_sum(tile_scatter_counters -> tile_offsets)
         {
-            uint32_t num_tiles_u32_local = (uint32_t)num_tiles;
+            NSUInteger tg2 = MIN(ctx->prefix_sum_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)1024);
+            [enc setComputePipelineState:ctx->prefix_sum_kernel_cpso];
+            ENC_SCALAR(enc, num_tiles_u32, 0); ENC_BUF(enc, g_tcache.tile_scatter_counters, 1); ENC_BUF(enc, g_tcache.tile_offsets, 2);
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg2, 1, 1)];
+        }
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        // 3. bitonic_sort_per_tile (reads prealloc_bins, writes packed + tile_bins)
+        {
             [enc setComputePipelineState:ctx->bitonic_sort_per_tile_kernel_cpso];
-            ENC_BUF(enc, g_tcache.tile_offsets, 0); ENC_BUF(enc, g_tcache.tile_counts, 1);
-            ENC_BUF(enc, isect_ids, 2);
+            ENC_BUF(enc, g_tcache.tile_offsets, 0); ENC_BUF(enc, g_tcache.tile_scatter_counters, 1);
+            ENC_BUF(enc, g_tcache.prealloc_bins, 2);
             ENC_BUF(enc, gaussian_ids, 3);
-            ENC_SCALAR(enc, num_tiles_u32_local, 4);
+            ENC_SCALAR(enc, num_tiles_u32, 4);
             ENC_BUF(enc, xys, 5); ENC_BUF(enc, conics, 6);
             ENC_BUF(enc, colors, 7); ENC_BUF(enc, opacities, 8);
             ENC_BUF(enc, packed_xy_opac, 9); ENC_BUF(enc, packed_conic, 10); ENC_BUF(enc, packed_rgb, 11);
+            ENC_BUF(enc, tile_bins, 12);
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
     };
@@ -1036,38 +994,31 @@ std::tuple<MTensor, float> msplat_train_step(
         }
     };
 
-    auto encode_loss_fwd = [&](id<MTLComputeCommandEncoder> enc) {
+    // Fused loss: ssim_h_fwd → fused_v_fwd_h_bwd → ssim_v_bwd
+    // Eliminates loss_intermediates round-trip (130 MB/iter bandwidth saved).
+    auto encode_loss_fwd_bwd = [&](id<MTLComputeCommandEncoder> enc) {
         MTLSize grid = MTLSizeMake(img_width, img_height, 1);
         MTLSize tg = MTLSizeMake(16, 16, 1);
+        // Pass 1: H conv on images → ssim_h_buf
         [enc setComputePipelineState:ctx->ssim_h_fwd_kernel_cpso];
         ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:2];
         ENC_BUF(enc, g_tcache.ssim_h_buf, 3);
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        [enc setComputePipelineState:ctx->ssim_v_fwd_kernel_cpso];
+        // Pass 2: Fused V fwd + H bwd
+        [enc setComputePipelineState:ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso];
         ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
         ENC_BUF(enc, g_tcache.ssim_h_buf, 2);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
-        ENC_SCALAR(enc, ssim_weight, 4);
-        ENC_BUF(enc, loss_intermediates, 5); ENC_BUF(enc, loss_sum, 6);
-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
-    };
-
-    // ========================== BACKWARD ENCODE LAMBDAS ==========================
-
-    auto encode_loss_bwd = [&](id<MTLComputeCommandEncoder> enc) {
-        MTLSize grid = MTLSizeMake(img_width, img_height, 1);
-        MTLSize tg = MTLSizeMake(16, 16, 1);
-        [enc setComputePipelineState:ctx->ssim_h_bwd_kernel_cpso];
-        ENC_BUF(enc, loss_intermediates, 0);
-        [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:1];
-        ENC_BUF(enc, g_tcache.ssim_h_buf, 2);
+        ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
+        ENC_BUF(enc, loss_intermediates, 6); ENC_BUF(enc, loss_sum, 7);
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        // Pass 3: V bwd
         [enc setComputePipelineState:ctx->ssim_v_bwd_kernel_cpso];
         ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
-        ENC_BUF(enc, g_tcache.ssim_h_buf, 2);
+        ENC_BUF(enc, loss_intermediates, 2);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
         ENC_BUF(enc, v_rendered, 6);
@@ -1123,6 +1074,23 @@ std::tuple<MTensor, float> msplat_train_step(
         }
     };
 
+    // Packed SH Adam hyperparameters (must match SHAdamParams in .metal)
+    struct SHAdamParams {
+        float dc_step_size, dc_bc2_sqrt;
+        float rest_step_size, rest_bc2_sqrt;
+        float beta1, beta2, eps;
+    };
+    auto sh_adam_hp = std::make_shared<SHAdamParams>();
+    if (num_adam_groups >= 5) {
+        sh_adam_hp->dc_step_size = adam_step_sizes[3];
+        sh_adam_hp->dc_bc2_sqrt = adam_bc2_sqrts[3];
+        sh_adam_hp->rest_step_size = adam_step_sizes[4];
+        sh_adam_hp->rest_bc2_sqrt = adam_bc2_sqrts[4];
+        sh_adam_hp->beta1 = adam_beta1;
+        sh_adam_hp->beta2 = adam_beta2;
+        sh_adam_hp->eps = adam_eps;
+    }
+
     auto encode_proj_sh_bwd_adam = [&](id<MTLComputeCommandEncoder> enc) {
         NSUInteger tpg = MIN(ctx->project_and_sh_backward_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
         [enc setComputePipelineState:ctx->project_and_sh_backward_kernel_cpso];
@@ -1136,12 +1104,21 @@ std::tuple<MTensor, float> msplat_train_step(
         ENC_BUF(enc, v_mean3d, 14); ENC_BUF(enc, v_scale, 15); ENC_BUF(enc, v_quat, 16);
         ENC_SCALAR(enc, degree, 17); ENC_SCALAR(enc, degrees_to_use, 18);
         [enc setBytes:cam_pos_arr->data() length:sizeof(*cam_pos_arr) atIndex:19];
-        ENC_BUF(enc, v_colors_rast, 20); ENC_BUF(enc, v_features_dc, 21); ENC_BUF(enc, v_features_rest, 22);
+        ENC_BUF(enc, v_colors_rast, 20);
+        // Fused SH backward + Adam: pass params + optimizer state instead of gradient buffers
+        [enc setBuffer:adam_params[3].buffer() offset:0 atIndex:21];  // features_dc params
+        [enc setBuffer:adam_params[4].buffer() offset:0 atIndex:22];  // features_rest params
+        [enc setBuffer:adam_exp_avg[3].buffer() offset:0 atIndex:23]; // dc exp_avg
+        [enc setBuffer:adam_exp_avg_sq[3].buffer() offset:0 atIndex:24]; // dc exp_avg_sq
+        [enc setBuffer:adam_exp_avg[4].buffer() offset:0 atIndex:25]; // rest exp_avg
+        [enc setBuffer:adam_exp_avg_sq[4].buffer() offset:0 atIndex:26]; // rest exp_avg_sq
+        [enc setBytes:sh_adam_hp.get() length:sizeof(SHAdamParams) atIndex:27];
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-        // Fused Adam step
+        // Adam for remaining groups (skip 3=featuresDc, 4=featuresRest — fused above)
         if (num_adam_groups > 0) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             for (int g = 0; g < num_adam_groups; ++g) {
+                if (g == 3 || g == 4) continue;  // fused into backward kernel
                 uint32_t n = adam_params[g].numel();
                 if (n == 0) continue;
                 NSUInteger atpg = MIN(ctx->fused_adam_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
@@ -1161,18 +1138,28 @@ std::tuple<MTensor, float> msplat_train_step(
         }
     };
 
-    // ========================== SINGLE ENCODER DISPATCH ==========================
+    // ========================== DISPATCH ==========================
 
-    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
-    assert(command_buffer && "Failed to retrieve command buffer reference");
+    // Encode accumulate_grad_stats as a lambda (shared by both paths)
+    auto encode_grad_stats = [&](id<MTLComputeCommandEncoder> enc) {
+        NSUInteger tpg = MIN(ctx->accumulate_grad_stats_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+        [enc setComputePipelineState:ctx->accumulate_grad_stats_kernel_cpso];
+        ENC_SCALAR(enc, num_points, 0);
+        ENC_BUF(enc, radii_out, 1);
+        ENC_BUF(enc, v_xy, 2);
+        ENC_BUF(enc, vis_counts, 3);
+        ENC_BUF(enc, xys_grad_norm, 4);
+        ENC_BUF(enc, max_2d_size, 5);
+        ENC_SCALAR(enc, inv_max_dim, 6);
+        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    };
 
-    dispatch_sync(ctx->d_queue, ^(){
-        // Blit-zero all accumulation buffers (GPU-side to avoid racing with pipelined CBs)
-        id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
-        [blit fillBuffer:tile_bins.buffer() range:NSMakeRange(0, tile_bins.nbytes()) value:0];
+    // Blit-zero helper (shared by both paths)
+    auto do_blit_zero = [&](id<MTLCommandBuffer> cb) {
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        // tile_bins written by sort kernel, tile_counts no longer used
         [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
         [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
-        [blit fillBuffer:g_tcache.tile_counts.buffer() range:NSMakeRange(0, g_tcache.tile_counts.nbytes()) value:0];
         [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
         [blit fillBuffer:v_xy.buffer() range:NSMakeRange(0, v_xy.nbytes()) value:0];
         [blit fillBuffer:v_conic.buffer() range:NSMakeRange(0, v_conic.nbytes()) value:0];
@@ -1182,47 +1169,161 @@ std::tuple<MTensor, float> msplat_train_step(
         [blit fillBuffer:v_mean3d.buffer() range:NSMakeRange(0, v_mean3d.nbytes()) value:0];
         [blit fillBuffer:v_scale.buffer() range:NSMakeRange(0, v_scale.nbytes()) value:0];
         [blit fillBuffer:v_quat.buffer() range:NSMakeRange(0, v_quat.nbytes()) value:0];
-        [blit fillBuffer:v_features_dc.buffer() range:NSMakeRange(0, v_features_dc.nbytes()) value:0];
-        [blit fillBuffer:v_features_rest.buffer() range:NSMakeRange(0, v_features_rest.nbytes()) value:0];
+        // v_features_dc and v_features_rest no longer needed — SH grads fused into Adam
         [blit endEncoding];
+    };
 
-        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
-        assert(enc && "Failed to create compute command encoder");
+    if (!g_profile_stages_checked) {
+        g_profile_stages = std::getenv("PROFILE_STAGES") != nullptr;
+        g_profile_stages_checked = true;
+    }
 
-        // --- Forward: proj_sh → prefix_map → rast_fwd → loss_fwd ---
-        encode_proj_sh(enc);
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        encode_prefix_map(enc);
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        encode_rast_fwd(enc);
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        encode_loss_fwd(enc);
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    if (g_profile_stages && ctx->counterSamplingAvailable) {
+        // Per-stage profiling: separate encoders on the SAME command buffer,
+        // each with start/end timestamp sampling via the pass descriptor.
+        // Metal handles inter-encoder resource hazard tracking automatically.
+        id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+        assert(command_buffer && "Failed to retrieve command buffer reference");
 
-        // --- Backward: loss_bwd → rast_bwd → proj_sh_bwd + Adam ---
-        encode_loss_bwd(enc);
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        encode_rast_bwd(enc);
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        encode_proj_sh_bwd_adam(enc);
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        id<MTLCounterSampleBuffer> csb = ctx->counterSampleBuffer;
+        double ticksToMs = ctx->ticksToMs;
 
-        // --- Accumulate grad stats ---
-        {
-            NSUInteger tpg = MIN(ctx->accumulate_grad_stats_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
-            [enc setComputePipelineState:ctx->accumulate_grad_stats_kernel_cpso];
-            ENC_SCALAR(enc, num_points, 0);
-            ENC_BUF(enc, radii_out, 1);
-            ENC_BUF(enc, v_xy, 2);
-            ENC_BUF(enc, vis_counts, 3);
-            ENC_BUF(enc, xys_grad_norm, 4);
-            ENC_BUF(enc, max_2d_size, 5);
-            ENC_SCALAR(enc, inv_max_dim, 6);
-            [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-        }
+        // Encode each stage in its own encoder with timestamp bookends
+        typedef void (^encode_fn_t)(id<MTLComputeCommandEncoder>);
+        struct StageInfo {
+            const char* name;
+            bool isBlit;  // true = blit encoder, false = compute encoder
+        };
 
-        [enc endEncoding];
-    });
+        dispatch_sync(ctx->d_queue, ^(){
+            // Stage 0: blit_zero (use blit encoder, no timestamp — blit pass descriptors
+            // don't support counter sampling the same way, so we just wrap it)
+            // Use a compute pass with start/end timestamps for the blit stage
+            // Actually, blit must use blit encoder. We'll measure it via a dummy compute
+            // encoder with timestamps before and after.
+
+            // -- Blit zero (no direct timestamp, included in first compute stage overhead) --
+            do_blit_zero(command_buffer);
+
+            // Stage encoders with timestamps
+            // We have 8 compute stages (indices 0-7 in counter sample buffer)
+            // Each stage uses sample indices: start = stage*2, end = stage*2+1
+            auto make_profiled_encoder = [&](int stage_idx) -> id<MTLComputeCommandEncoder> {
+                MTLComputePassDescriptor *passDesc = [MTLComputePassDescriptor computePassDescriptor];
+                passDesc.sampleBufferAttachments[0].sampleBuffer = csb;
+                passDesc.sampleBufferAttachments[0].startOfEncoderSampleIndex = stage_idx * 2;
+                passDesc.sampleBufferAttachments[0].endOfEncoderSampleIndex = stage_idx * 2 + 1;
+                return [command_buffer computeCommandEncoderWithDescriptor:passDesc];
+            };
+
+            id<MTLComputeCommandEncoder> enc;
+
+            // Stage 1: proj_sh_fwd
+            enc = make_profiled_encoder(0);
+            encode_proj_sh(enc);
+            [enc endEncoding];
+
+            // Stage 2: prefix_sort_pack
+            enc = make_profiled_encoder(1);
+            encode_prefix_map(enc);
+            [enc endEncoding];
+
+            // Stage 3: rast_fwd
+            enc = make_profiled_encoder(2);
+            encode_rast_fwd(enc);
+            [enc endEncoding];
+
+            // Stage 4+5: loss_fwd_bwd (fused)
+            enc = make_profiled_encoder(3);
+            encode_loss_fwd_bwd(enc);
+            [enc endEncoding];
+
+            // Stage 5: rast_bwd
+            enc = make_profiled_encoder(4);
+            encode_rast_bwd(enc);
+            [enc endEncoding];
+
+            // Stage 6: proj_sh_bwd + Adam
+            enc = make_profiled_encoder(5);
+            encode_proj_sh_bwd_adam(enc);
+            [enc endEncoding];
+
+            // Stage 7: grad_stats
+            enc = make_profiled_encoder(6);
+            encode_grad_stats(enc);
+            [enc endEncoding];
+        });
+
+        // Add completion handler to read timestamps after GPU finishes
+        [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            @autoreleasepool {
+                NSData *data = [csb resolveCounterRange:NSMakeRange(0, (N_TRAIN_STAGES - 1) * 2)];
+                if (!data) return;
+                const MTLCounterResultTimestamp *samples =
+                    (const MTLCounterResultTimestamp *)[data bytes];
+
+                std::lock_guard<std::mutex> lock(g_stage_timing_mutex);
+                for (int i = 0; i < N_TRAIN_STAGES - 1; i++) {
+                    uint64_t start = samples[i * 2].timestamp;
+                    uint64_t end = samples[i * 2 + 1].timestamp;
+                    if (start == MTLCounterErrorValue || end == MTLCounterErrorValue) continue;
+                    // stage_idx 0-7 maps to g_train_stage_names[1-8] (skip blit_zero)
+                    g_stage_times[i + 1].push_back((double)(end - start) * ticksToMs);
+                }
+                g_stage_report_count++;
+
+                if (g_stage_report_count % 500 == 0) {
+                    fprintf(stderr, "\n  === GPU Stage Profile (n=%d) ===\n", g_stage_report_count);
+                    double total_median = 0;
+                    for (int i = 1; i < N_TRAIN_STAGES; i++) {
+                        auto &v = g_stage_times[i];
+                        if (v.empty()) continue;
+                        auto sorted = v;
+                        std::sort(sorted.begin(), sorted.end());
+                        double med = sorted[sorted.size() / 2];
+                        double sum = 0;
+                        for (auto x : sorted) sum += x;
+                        total_median += med;
+                        fprintf(stderr, "  %-20s median=%.3fms  mean=%.3fms\n",
+                                g_train_stage_names[i], med, sum / sorted.size());
+                    }
+                    fprintf(stderr, "  %-20s %.3fms\n", "TOTAL (sum medians)", total_median);
+                }
+            }
+        }];
+
+    } else {
+        // Production: single encoder for everything
+        id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+        assert(command_buffer && "Failed to retrieve command buffer reference");
+
+        dispatch_sync(ctx->d_queue, ^(){
+            do_blit_zero(command_buffer);
+
+            id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+            assert(enc && "Failed to create compute command encoder");
+
+            // --- Forward: proj_sh → prefix_map → rast_fwd → loss_fwd ---
+            encode_proj_sh(enc);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_prefix_map(enc);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_rast_fwd(enc);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            // --- Fused loss forward + backward ---
+            encode_loss_fwd_bwd(enc);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_rast_bwd(enc);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_proj_sh_bwd_adam(enc);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            // --- Accumulate grad stats ---
+            encode_grad_stats(enc);
+
+            [enc endEncoding];
+        });
+    }
 
     float loss_val = *loss_sum.data<float>() / (float)(img_height * img_width);
     return std::make_tuple(radii_out, loss_val);

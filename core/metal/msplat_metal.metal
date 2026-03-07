@@ -1786,6 +1786,30 @@ kernel void project_and_sh_forward_kernel(
     sh_coeffs_to_color(degrees_to_use, viewdir, &(features_dc[dc_idx]), &(features_rest[rest_idx]), &(colors[idx_col]));
 }
 
+// Adam update helper — applies one Adam step to a single element.
+// Computes in registers, writes param/exp_avg/exp_avg_sq back to device memory.
+inline void adam_update_element(
+    device float& param, device float& ea, device float& eas,
+    float grad, float step_size, float beta1, float beta2, float bc2_sqrt, float eps
+) {
+    float m = fma(beta1, ea, (1.0f - beta1) * grad);
+    float v = fma(beta2, eas, (1.0f - beta2) * grad * grad);
+    param -= step_size * m / (sqrt(v) / bc2_sqrt + eps);
+    ea = m;
+    eas = v;
+}
+
+// Packed Adam hyperparameters for SH groups (passed via setBytes)
+struct SHAdamParams {
+    float dc_step_size;
+    float dc_bc2_sqrt;
+    float rest_step_size;
+    float rest_bc2_sqrt;
+    float beta1;
+    float beta2;
+    float eps;
+};
+
 kernel void project_and_sh_backward_kernel(
     // Projection backward args
     constant int& num_points,
@@ -1805,13 +1829,18 @@ kernel void project_and_sh_backward_kernel(
     device float* v_mean3d,
     device float* v_scale,
     device float* v_quat,
-    // SH backward args
+    // SH backward + fused Adam args
     constant uint& degree,
     constant uint& degrees_to_use,
     constant float3& cam_pos,
     constant float* v_colors,
-    device float* v_features_dc,
-    device float* v_features_rest,
+    device float* features_dc,         // params (read-write for Adam)
+    device float* features_rest,       // params (read-write for Adam)
+    device float* dc_exp_avg,          // Adam state
+    device float* dc_exp_avg_sq,
+    device float* rest_exp_avg,
+    device float* rest_exp_avg_sq,
+    constant SHAdamParams& adam_hp,
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)num_points || radii[idx] <= 0) {
@@ -1880,14 +1909,80 @@ kernel void project_and_sh_backward_kernel(
     v_scale[3*idx + 1] *= exp_scale.y;
     v_scale[3*idx + 2] *= exp_scale.z;
 
-    // SH backward: reuse p_world (does NOT contribute to v_mean3d)
+    // ---- Fused SH backward + Adam ----
+    // Compute SH gradients in registers and apply Adam inline.
+    // Eliminates v_features_dc/v_features_rest write+read round-trip (~600 MB/iter at 1.6M gaussians).
     float3 viewdir = normalize(p_world - cam_pos);
     const uint num_channels = 3;
     uint num_bases = num_sh_bases(degree);
     uint dc_idx = num_channels * idx;
     uint rest_idx = (num_bases - 1) * num_channels * idx;
     uint idx_col = num_channels * idx;
-    sh_coeffs_to_color_vjp(degrees_to_use, viewdir, &(v_colors[idx_col]), &(v_features_dc[dc_idx]), &(v_features_rest[rest_idx]));
+
+    float vc[3] = { v_colors[idx_col], v_colors[idx_col + 1], v_colors[idx_col + 2] };
+
+    // DC: grad = SH_C0 * v_colors[c]
+    for (int c = 0; c < 3; c++) {
+        float g = SH_C0 * vc[c];
+        adam_update_element(features_dc[dc_idx + c], dc_exp_avg[dc_idx + c], dc_exp_avg_sq[dc_idx + c],
+                           g, adam_hp.dc_step_size, adam_hp.beta1, adam_hp.beta2, adam_hp.dc_bc2_sqrt, adam_hp.eps);
+    }
+
+    if (degrees_to_use < 1) return;
+
+    float x = viewdir.x, y = viewdir.y, z = viewdir.z;
+    float xx = x*x, xy = x*y, xz = x*z, yy = y*y, yz = y*z, zz = z*z;
+
+    // SH degree 1 (3 bases)
+    float sh1[3] = { -SH_C1 * y, SH_C1 * z, -SH_C1 * x };
+    for (int b = 0; b < 3; b++) {
+        for (int c = 0; c < 3; c++) {
+            uint i = rest_idx + b * 3 + c;
+            float g = sh1[b] * vc[c];
+            adam_update_element(features_rest[i], rest_exp_avg[i], rest_exp_avg_sq[i],
+                               g, adam_hp.rest_step_size, adam_hp.beta1, adam_hp.beta2, adam_hp.rest_bc2_sqrt, adam_hp.eps);
+        }
+    }
+
+    if (degrees_to_use < 2) return;
+
+    // SH degree 2 (5 bases)
+    float sh2[5] = {
+        SH_C2[0] * xy,
+        SH_C2[1] * yz,
+        SH_C2[2] * (2.f * zz - xx - yy),
+        SH_C2[3] * xz,
+        SH_C2[4] * (xx - yy)
+    };
+    for (int b = 0; b < 5; b++) {
+        for (int c = 0; c < 3; c++) {
+            uint i = rest_idx + (3 + b) * 3 + c;
+            float g = sh2[b] * vc[c];
+            adam_update_element(features_rest[i], rest_exp_avg[i], rest_exp_avg_sq[i],
+                               g, adam_hp.rest_step_size, adam_hp.beta1, adam_hp.beta2, adam_hp.rest_bc2_sqrt, adam_hp.eps);
+        }
+    }
+
+    if (degrees_to_use < 3) return;
+
+    // SH degree 3 (7 bases)
+    float sh3[7] = {
+        SH_C3[0] * y * (3.f * xx - yy),
+        SH_C3[1] * xy * z,
+        SH_C3[2] * y * (4.f * zz - xx - yy),
+        SH_C3[3] * z * (2.f * zz - 3.f * xx - 3.f * yy),
+        SH_C3[4] * x * (4.f * zz - xx - yy),
+        SH_C3[5] * z * (xx - yy),
+        SH_C3[6] * x * (xx - 3.f * yy)
+    };
+    for (int b = 0; b < 7; b++) {
+        for (int c = 0; c < 3; c++) {
+            uint i = rest_idx + (8 + b) * 3 + c;
+            float g = sh3[b] * vc[c];
+            adam_update_element(features_rest[i], rest_exp_avg[i], rest_exp_avg_sq[i],
+                               g, adam_hp.rest_step_size, adam_hp.beta1, adam_hp.beta2, adam_hp.rest_bc2_sqrt, adam_hp.eps);
+        }
+    }
 }
 
 // ===== Pack Sorted Gaussians Kernel =====
@@ -1919,62 +2014,26 @@ kernel void pack_sorted_gaussians_kernel(
 }
 
 // ===== Tile-Local Sorting Kernels =====
-// Replaces global radix sort with: count by tile → scatter to tile bins → per-tile bitonic sort.
+// Pre-allocated per-tile bins: scatter directly to fixed-size bins, then sort in-place.
+// Eliminates count→prefix_sum→scatter pipeline (3 dispatches + 3 barriers saved).
 
 #define SORT_TG_SIZE 256
 #define MAX_TILE_ELEMS 2048
 
-// Count how many intersections each tile has (for computing tile bin offsets).
-kernel void count_intersections_per_tile_kernel(
-    constant uint& num_points       [[buffer(0)]],
-    constant float* xys             [[buffer(1)]],
-    constant int* radii             [[buffer(2)]],
-    constant float* aabb            [[buffer(3)]],
-    constant uint3& tile_bounds     [[buffer(4)]],
-    device atomic_uint* tile_counts [[buffer(5)]],
-    uint idx [[thread_position_in_grid]]
-) {
-    if (idx >= num_points) return;
-    if (radii[idx] <= 0) return;
-    float2 center = read_packed_float2(xys, idx);
-    uint2 tile_min, tile_max;
-    get_tile_bbox(center, read_packed_float2(aabb, idx), (int3)tile_bounds, tile_min, tile_max);
-    for (uint i = tile_min.y; i < tile_max.y; i++) {
-        for (uint j = tile_min.x; j < tile_max.x; j++) {
-            uint tile_id = i * tile_bounds.x + j;
-            atomic_fetch_add_explicit(&tile_counts[tile_id], 1u, memory_order_relaxed);
-        }
-    }
-}
-
-// Scatter each gaussian's intersections into per-tile bins.
-// sort_pairs[tile_start + pos] = (depth_bits << 32) | gaussian_id
-// Also writes tile_bins from tile_offsets/tile_counts (first num_tiles threads).
-kernel void scatter_to_tiles_kernel(
+// Scatter each gaussian's intersections directly into pre-allocated per-tile bins.
+// Each tile gets MAX_TILE_ELEMS slots. Per-tile atomics track fill count.
+kernel void scatter_to_prealloc_bins_kernel(
     constant uint& num_points               [[buffer(0)]],
     constant float* xys                     [[buffer(1)]],
     constant float* depths                  [[buffer(2)]],
     constant int* radii                     [[buffer(3)]],
     constant float* aabb                    [[buffer(4)]],
     constant uint3& tile_bounds             [[buffer(5)]],
-    constant int* tile_offsets              [[buffer(6)]],  // inclusive prefix sum
-    constant int* tile_counts_in            [[buffer(7)]],
-    device atomic_uint* scatter_counters    [[buffer(8)]],
-    device uint64_t* sort_pairs             [[buffer(9)]],
-    device int* tile_bins                   [[buffer(10)]],
-    constant uint& capacity                 [[buffer(11)]],
-    device atomic_uint* overflow_flag       [[buffer(12)]],
-    constant uint& num_tiles                [[buffer(13)]],
+    device atomic_uint* scatter_counters    [[buffer(6)]],
+    device uint64_t* prealloc_bins          [[buffer(7)]],
+    device atomic_uint* overflow_flag       [[buffer(8)]],
     uint idx [[thread_position_in_grid]]
 ) {
-    // First num_tiles threads write tile_bins
-    if (idx < num_tiles) {
-        int count = tile_counts_in[idx];
-        int end = tile_offsets[idx];
-        int start = end - count;
-        write_packed_int2(tile_bins, idx, int2(start, end));
-    }
-
     if (idx >= num_points) return;
     if (radii[idx] <= 0) return;
 
@@ -1988,23 +2047,24 @@ kernel void scatter_to_tiles_kernel(
         for (uint j = tile_min.x; j < tile_max.x; j++) {
             uint tile_id = i * tile_bounds.x + j;
             uint pos = atomic_fetch_add_explicit(&scatter_counters[tile_id], 1u, memory_order_relaxed);
-            int tile_start = tile_offsets[tile_id] - tile_counts_in[tile_id];
-            uint global_pos = (uint)tile_start + pos;
-            if (global_pos >= capacity) {
+            if (pos >= MAX_TILE_ELEMS) {
+                // Clamp counter so prefix_sum sees at most MAX_TILE_ELEMS
+                atomic_store_explicit(&scatter_counters[tile_id], MAX_TILE_ELEMS, memory_order_relaxed);
                 atomic_store_explicit(overflow_flag, 1u, memory_order_relaxed);
-                return;
+                continue;
             }
-            sort_pairs[global_pos] = ((uint64_t)depth_bits << 32) | (uint64_t)idx;
+            prealloc_bins[(uint64_t)tile_id * MAX_TILE_ELEMS + pos] = ((uint64_t)depth_bits << 32) | (uint64_t)idx;
         }
     }
 }
 
-// Bitonic sort per tile in shared memory. Sorts by depth (upper 32 bits of uint64).
-// Writes sorted gaussian_ids to output.
+// Bitonic sort per tile in shared memory. Reads from pre-allocated bins.
+// Writes sorted packed data to contiguous output (using tile_offsets from prefix sum).
+// Also writes tile_bins for the rasterizer.
 kernel void bitonic_sort_per_tile_kernel(
     constant int* tile_offsets          [[buffer(0)]],
     constant int* tile_counts_in        [[buffer(1)]],
-    device uint64_t* sort_pairs         [[buffer(2)]],
+    constant uint64_t* prealloc_bins    [[buffer(2)]],
     device int32_t* gaussian_ids_out    [[buffer(3)]],
     constant uint& num_tiles            [[buffer(4)]],
     // Pack buffers (fused sort+pack: eliminates separate pack dispatch)
@@ -2015,26 +2075,34 @@ kernel void bitonic_sort_per_tile_kernel(
     device float* packed_xy_opac        [[buffer(9)]],
     device float* packed_conic          [[buffer(10)]],
     device float* packed_rgb            [[buffer(11)]],
+    device int* tile_bins               [[buffer(12)]],
     uint tg_id [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]
 ) {
     if (tg_id >= num_tiles) return;
 
-    int count = tile_counts_in[tg_id];
-    if (count == 0) return;
-    int start = tile_offsets[tg_id] - count;
+    int count_raw = tile_counts_in[tg_id];
+    int count = min(count_raw, MAX_TILE_ELEMS);
+    int end = tile_offsets[tg_id];
+    int start = end - count;
 
-    int n_load = min(count, MAX_TILE_ELEMS);
+    // Write tile_bins for rasterizer
+    if (tid == 0) {
+        write_packed_int2(tile_bins, tg_id, int2(start, end));
+    }
+
+    if (count == 0) return;
 
     // Round up to next power of 2
     int n = 1;
-    while (n < n_load) n <<= 1;
+    while (n < count) n <<= 1;
 
     threadgroup uint64_t data[MAX_TILE_ELEMS];
 
-    // Load into shared memory
+    // Load from pre-allocated bins
+    uint64_t bin_base = (uint64_t)tg_id * MAX_TILE_ELEMS;
     for (int i = (int)tid; i < n; i += SORT_TG_SIZE) {
-        data[i] = (i < n_load) ? sort_pairs[start + i] : 0xFFFFFFFFFFFFFFFFULL;
+        data[i] = (i < count) ? prealloc_bins[bin_base + i] : 0xFFFFFFFFFFFFFFFFULL;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -2057,7 +2125,7 @@ kernel void bitonic_sort_per_tile_kernel(
     }
 
     // Fused sort+pack: extract gaussian IDs, read per-gaussian data, write packed buffers
-    for (int i = (int)tid; i < n_load; i += SORT_TG_SIZE) {
+    for (int i = (int)tid; i < count; i += SORT_TG_SIZE) {
         int32_t g_id = (int32_t)(data[i] & 0xFFFFFFFF);
         int global_idx = start + i;
         gaussian_ids_out[global_idx] = g_id;
@@ -3150,6 +3218,98 @@ kernel void ssim_v_fwd_kernel(
     if (tr == 0) {
         atomic_fetch_add_explicit(loss_sum, tg_sum[0], memory_order_relaxed);
     }
+}
+
+// Fused V-forward + H-backward: recomputes SSIM stats from ssim_h_buf (V conv),
+// computes loss + derivative fields, then H convs derivatives to output buffer.
+// Eliminates loss_intermediates round-trip (130 MB/iter bandwidth saved).
+kernel void ssim_fused_v_fwd_h_bwd_kernel(
+    constant float* rendered, constant float* gt,
+    constant float* ssim_h_buf, constant uint2& img_size,
+    constant float& ssim_weight, constant float& inv_n,
+    device float* deriv_h_buf, device atomic_float* loss_sum,
+    uint2 gid [[thread_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]], uint2 tgid [[threadgroup_position_in_grid]],
+    uint2 tg_size [[threads_per_threadgroup]]
+) {
+    const uint W = img_size.x, H = img_size.y;
+    const uint px = gid.x, py = gid.y;
+    const int base_gx = (int)(tgid.x * SSIM_TG) - SSIM_HALF_WIN;
+    const int base_gy = (int)(tgid.y * SSIM_TG) - SSIM_HALF_WIN;
+    constexpr uint TILE_DIM = SSIM_TG + 2 * SSIM_HALF_WIN;
+    constexpr uint TILE_PIXELS = TILE_DIM * TILE_DIM;
+    float ssim_sum = 0.0f, l1_sum = 0.0f;
+
+    for (uint c = 0; c < 3; c++) {
+        threadgroup float tg_hp[TILE_DIM][TILE_DIM][5];
+        for (uint i = tr; i < TILE_PIXELS; i += SSIM_TG * SSIM_TG) {
+            uint sy = i / TILE_DIM, sx = i % TILE_DIM;
+            int gy = base_gy + (int)sy, gx = base_gx + (int)sx;
+            if (gx >= 0 && gx < (int)W && gy >= 0 && gy < (int)H) {
+                uint hp = (gy * W + gx) * 15 + c * 5;
+                for (uint f = 0; f < 5; f++) tg_hp[sy][sx][f] = ssim_h_buf[hp + f];
+            } else {
+                for (uint f = 0; f < 5; f++) tg_hp[sy][sx][f] = 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup float tg_f1[SSIM_TG][TILE_DIM], tg_f2[SSIM_TG][TILE_DIM], tg_f3[SSIM_TG][TILE_DIM];
+        constexpr uint DERIV_PIXELS = SSIM_TG * TILE_DIM;
+        for (uint i = tr; i < DERIV_PIXELS; i += SSIM_TG * SSIM_TG) {
+            uint dy = i / TILE_DIM, dx = i % TILE_DIM;
+            uint tile_y = dy + SSIM_HALF_WIN;
+            float mu_x=0, mu_y=0, sq_x=0, sq_y=0, cross_xy=0;
+            for (uint k = 0; k < SSIM_WIN; k++) {
+                float w = GAUSS_1D[k];
+                mu_x += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][0];
+                mu_y += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][1];
+                sq_x += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][2];
+                sq_y += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][3];
+                cross_xy += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][4];
+            }
+            float sigma_x_sq = sq_x - mu_x*mu_x, sigma_y_sq = sq_y - mu_y*mu_y;
+            float sigma_xy = cross_xy - mu_x*mu_y;
+            float A = 2.0f*mu_x*mu_y + SSIM_C1, B = 2.0f*sigma_xy + SSIM_C2;
+            float Cd = mu_x*mu_x + mu_y*mu_y + SSIM_C1, D = sigma_x_sq + sigma_y_sq + SSIM_C2;
+            float iCD = 1.0f / (Cd * D);
+            float dmu = 2.0f*B*(mu_x*Cd - A*mu_y) / (Cd*Cd*D);
+            float dsyq = -A*B*iCD/D, dsxy = 2.0f*A*iCD;
+            tg_f1[dy][dx] = dmu - 2.0f*mu_y*dsyq - mu_x*dsxy;
+            tg_f2[dy][dx] = 2.0f*dsyq;
+            tg_f3[dy][dx] = dsxy;
+            if (dx >= SSIM_HALF_WIN && dx < SSIM_HALF_WIN + SSIM_TG) {
+                int gpx = base_gx + (int)dx, gpy = base_gy + (int)(dy + SSIM_HALF_WIN);
+                if (gpx >= 0 && gpx < (int)W && gpy >= 0 && gpy < (int)H) {
+                    ssim_sum += (A * B) / (Cd * D);
+                    l1_sum += fabs(gt[(gpy*W+gpx)*3+c] - rendered[(gpy*W+gpx)*3+c]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (px < W && py < H) {
+            float h1=0, h2=0, h3=0;
+            for (uint dx = 0; dx < SSIM_WIN; dx++) {
+                float w = GAUSS_1D[SSIM_WIN-1-dx];
+                h1 += w*tg_f1[lid.y][lid.x+dx]; h2 += w*tg_f2[lid.y][lid.x+dx]; h3 += w*tg_f3[lid.y][lid.x+dx];
+            }
+            uint out = (py*W+px)*15 + c*5;
+            deriv_h_buf[out+0]=h1; deriv_h_buf[out+1]=h2; deriv_h_buf[out+2]=h3;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float pixel_loss = (px < W && py < H) ? ssim_weight*(1.0f-ssim_sum/3.0f) + (1.0f-ssim_weight)*l1_sum/3.0f : 0.0f;
+    threadgroup float tg_sum[256];
+    tg_sum[tr] = pixel_loss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint tg_total = tg_size.x * tg_size.y;
+    for (uint s = tg_total/2; s > 0; s >>= 1) {
+        if (tr < s) tg_sum[tr] += tg_sum[tr+s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tr == 0) atomic_fetch_add_explicit(loss_sum, tg_sum[0], memory_order_relaxed);
 }
 
 // Backward pass 1: compute derivative fields + horizontal convolution.

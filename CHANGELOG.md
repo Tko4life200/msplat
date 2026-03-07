@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.1.3 — Fused kernels + pre-allocated tile bins
+
+- **Fused SH backward into Adam optimizer** — spherical harmonics gradients are now
+  computed in registers and fed directly into Adam updates, eliminating a ~600 MB/iter
+  device memory round-trip (at 1.5M gaussians).
+- **Fused SSIM vertical-forward + horizontal-backward** — replaces two separate passes
+  with a single kernel that recomputes V-conv from the H-buffer, saving ~130 MB/iter
+  of intermediate buffer traffic.
+- **Pre-allocated per-tile bins** — replaces the count→prefix-sum→scatter intersection
+  pipeline with direct scatter to fixed-size per-tile bins. Eliminates 3 kernel
+  dispatches and 3 memory barriers per iteration. `prefix_sort_pack` stage reduced
+  from 19% to 10% of GPU time.
+- **14–48% faster training** across mipnerf360 scenes. Improvement scales with gaussian
+  count: garden 30K (3.5M gaussians) sees the largest speedup at 48%.
+- **Per-stage GPU profiling** — `PROFILE_STAGES=1` enables Metal timestamp counter
+  sampling per pipeline stage. Uses separate compute encoders on the same command buffer
+  with `MTLComputePassDescriptor` for zero-overhead timestamp capture.
+- **GPU timing instrumentation** — `PROFILE_GPU=1` adds completion handler timing to
+  command buffers, reporting per-CB GPU execution time without affecting the
+  `commitAndContinue` pipeline.
+
 ## v1.1.2
 
 - Added `py.typed` marker (PEP 561) — type checkers now discover stubs automatically
