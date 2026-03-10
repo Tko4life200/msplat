@@ -1,60 +1,35 @@
 import SwiftUI
 import Msplat
-import MsplatCore
 import AppKit
 import QuartzCore
-import Accelerate
 
 // MARK: - Pixel conversion
 
-/// Reusable RGBA buffer to avoid per-frame allocation
-final class RGBABuffer {
-    var bytes: UnsafeMutablePointer<UInt8>
-    var capacity: Int
+nonisolated(unsafe) var displayReady: Int32 = 1
 
-    init() { bytes = .allocate(capacity: 0); capacity = 0 }
-    deinit { bytes.deallocate() }
-
-    func ensure(_ count: Int) {
-        guard count > capacity else { return }
-        bytes.deallocate()
-        bytes = .allocate(capacity: count)
-        capacity = count
-    }
-}
-
-nonisolated(unsafe) let rgbaBuffer = RGBABuffer()
-
-/// Build CGImage directly from C pixel buffer. Reuses a persistent RGBA buffer.
-func pixelBufferToCGImage(_ buf: MsplatPixelBuffer) -> CGImage {
-    let w = Int(buf.width), h = Int(buf.height)
+/// Convert PixelData (RGB float32) to NSImage (RGBA uint8).
+func pixelDataToNSImage(_ pd: PixelData) -> NSImage {
+    let w = pd.width, h = pd.height
     let n = w * h
-    let src = buf.data!
-    let needed = n * 4
-    rgbaBuffer.ensure(needed)
-    let dst = rgbaBuffer.bytes
-
-    // Single-pass RGB float → RGBA uint8
-    for i in 0..<n {
-        let r = src[i * 3], g = src[i * 3 + 1], b = src[i * 3 + 2]
-        dst[i * 4]     = UInt8(min(max(r, 0), 1) * 255)
-        dst[i * 4 + 1] = UInt8(min(max(g, 0), 1) * 255)
-        dst[i * 4 + 2] = UInt8(min(max(b, 0), 1) * 255)
-        dst[i * 4 + 3] = 255
+    let rgba = UnsafeMutablePointer<UInt8>.allocate(capacity: n * 4)
+    pd.pixels.withUnsafeBufferPointer { src in
+        for i in 0..<n {
+            rgba[i * 4]     = UInt8(min(max(src[i * 3], 0), 1) * 255)
+            rgba[i * 4 + 1] = UInt8(min(max(src[i * 3 + 1], 0), 1) * 255)
+            rgba[i * 4 + 2] = UInt8(min(max(src[i * 3 + 2], 0), 1) * 255)
+            rgba[i * 4 + 3] = 255
+        }
     }
-
-    let provider = CGDataProvider(dataInfo: nil, data: dst, size: needed,
-                                   releaseData: { _, _, _ in })!
-    return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
-                   bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
-                   bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
-                   provider: provider, decode: nil, shouldInterpolate: false,
-                   intent: .defaultIntent)!
-}
-
-func pixelBufferToNSImage(_ buf: MsplatPixelBuffer) -> NSImage {
-    let cg = pixelBufferToCGImage(buf)
-    return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+    let data = Data(bytesNoCopy: rgba, count: n * 4, deallocator: .custom { ptr, _ in
+        ptr.deallocate()
+    })
+    let provider = CGDataProvider(data: data as CFData)!
+    let cgImg = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
+                        bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                        provider: provider, decode: nil, shouldInterpolate: false,
+                        intent: .defaultIntent)!
+    return NSImage(cgImage: cgImg, size: NSSize(width: w, height: h))
 }
 
 // MARK: - Vector helpers
@@ -190,16 +165,14 @@ final class Engine: ObservableObject {
     private func beginTraining(datasetPath: String) {
         Thread.detachNewThread { [weak self] in
             guard let self else { return }
+          autoreleasepool {
 
-            // Use C API directly to avoid extra copies in the hot path
-            let ds = msplat_dataset_create(datasetPath, 1.0, false, 8)!
-            let numCameras = Int(msplat_dataset_num_train(ds))
-
-            var config = msplat_default_config()
+            let dataset = GaussianDataset(path: datasetPath)
+            var config = TrainingConfig()
             config.iterations = 2_000
             config.numDownscales = 0
             config.bgColor = (0, 0, 0)
-            let trainer = msplat_trainer_create(ds, config)!
+            let trainer = GaussianTrainer(dataset: dataset, config: config)
 
             DispatchQueue.main.async { self.phase = .training }
 
@@ -208,22 +181,21 @@ final class Engine: ObservableObject {
             var batchSteps = 0
 
             for i in 0..<2_000 {
-                let stats = msplat_trainer_step(trainer)
+                let stats = trainer.step()
                 batchSteps += 1
 
                 if i % 25 == 0 || i == 1_999 {
                     let batchEnd = CACurrentMediaTime()
                     let avgMs = Float((batchEnd - batchStart) / Double(batchSteps) * 1000.0)
 
-                    let buf = msplat_trainer_render(trainer, 0, false)
-                    let img = pixelBufferToNSImage(buf)
-                    free(buf.data)
+                    let pd = trainer.render(cameraIndex: 0)
+                    let img = pixelDataToNSImage(pd)
                     let iter = stats.iteration
                     let count = stats.splatCount
                     DispatchQueue.main.async {
                         self.image = img
-                        self.iteration = Int(iter)
-                        self.splatCount = Int(count)
+                        self.iteration = iter
+                        self.splatCount = count
                         self.msPerStep = avgMs
                     }
 
@@ -232,29 +204,24 @@ final class Engine: ObservableObject {
                 }
             }
 
-            let finalCount = Int(msplat_trainer_splat_count(trainer))
+            let finalCount = trainer.splatCount
             DispatchQueue.main.async {
                 self.splatCount = finalCount
                 self.phase = .orbiting
             }
 
-            // Phase 2: Smooth circular orbit — use C API for zero-copy render
-            var poses = [[Float]]()
-            for i in 0..<numCameras {
-                var pose = [Float](repeating: 0, count: 16)
-                msplat_dataset_camera_pose(ds, Int32(i), &pose)
-                poses.append(pose)
-            }
+            // Phase 2: Smooth circular orbit with zero-copy render
+            let poses = (0..<dataset.numTrain).map { dataset.cameraPose(at: $0) }
             let orbit = computeOrbitParams(poses)
             var frameCount = 0
             var fpsTimer = CACurrentMediaTime()
 
             // Query dimensions once to pre-allocate RGBA buffer
             var imgW: Int32 = 0, imgH: Int32 = 0
-            var firstPose = lookAtCamToWorld(eye: orbit.eyeCenter, target: orbit.lookAt, up: orbit.up)
-            msplat_trainer_render_pose_to_buffer(trainer, &firstPose, 0, nil, &imgW, &imgH)
+            let firstPose = lookAtCamToWorld(eye: orbit.eyeCenter, target: orbit.lookAt, up: orbit.up)
+            trainer.renderFromPoseToBuffer(camToWorld: firstPose, rgba: nil,
+                                           width: &imgW, height: &imgH)
             let rgbaBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: Int(imgW * imgH) * 4)
-            // Pre-fill alpha channel
             for i in 0..<Int(imgW * imgH) { rgbaBuf[i * 4 + 3] = 255 }
 
             let colorSpace = CGColorSpaceCreateDeviceRGB()
@@ -264,6 +231,7 @@ final class Engine: ObservableObject {
             let orbitStart = CACurrentMediaTime()
 
             while true {
+                autoreleasepool {
                     let elapsed = CACurrentMediaTime() - orbitStart
                     let angle = Float(elapsed / orbitPeriod) * 2.0 * .pi
                     let cosA = cos(angle), sinA = sin(angle)
@@ -274,19 +242,9 @@ final class Engine: ObservableObject {
                         orbit.eyeCenter.2 + orbit.radius * (cosA * t1.2 + sinA * t2.2)
                     )
 
-                    var pose = lookAtCamToWorld(eye: eye, target: orbit.lookAt, up: orbit.up)
-                    msplat_trainer_render_pose_to_buffer(trainer, &pose, 0, rgbaBuf, &imgW, &imgH)
-
-                    let provider = CGDataProvider(dataInfo: nil, data: rgbaBuf,
-                                                   size: Int(imgW * imgH) * 4,
-                                                   releaseData: { _, _, _ in })!
-                    let cgImg = CGImage(width: Int(imgW), height: Int(imgH),
-                                        bitsPerComponent: 8, bitsPerPixel: 32,
-                                        bytesPerRow: Int(imgW) * 4, space: colorSpace,
-                                        bitmapInfo: bitmapInfo, provider: provider,
-                                        decode: nil, shouldInterpolate: false,
-                                        intent: .defaultIntent)!
-                    let img = NSImage(cgImage: cgImg, size: NSSize(width: Int(imgW), height: Int(imgH)))
+                    let pose = lookAtCamToWorld(eye: eye, target: orbit.lookAt, up: orbit.up)
+                    trainer.renderFromPoseToBuffer(camToWorld: pose, rgba: rgbaBuf,
+                                                   width: &imgW, height: &imgH)
                     frameCount += 1
 
                     var currentFps: Float = 0
@@ -298,12 +256,28 @@ final class Engine: ObservableObject {
                         fpsTimer = now
                     }
 
-                    let fpsVal = currentFps
-                    DispatchQueue.main.async {
-                        self.image = img
-                        if fpsVal > 0 { self.fps = fpsVal }
+                    // Only push to UI if main thread consumed previous frame
+                    if OSAtomicCompareAndSwap32(1, 0, &displayReady) {
+                        let provider = CGDataProvider(dataInfo: nil, data: rgbaBuf,
+                                                       size: Int(imgW * imgH) * 4,
+                                                       releaseData: { _, _, _ in })!
+                        let cgImg = CGImage(width: Int(imgW), height: Int(imgH),
+                                            bitsPerComponent: 8, bitsPerPixel: 32,
+                                            bytesPerRow: Int(imgW) * 4, space: colorSpace,
+                                            bitmapInfo: bitmapInfo, provider: provider,
+                                            decode: nil, shouldInterpolate: false,
+                                            intent: .defaultIntent)!
+                        let img = NSImage(cgImage: cgImg, size: NSSize(width: Int(imgW), height: Int(imgH)))
+                        let fpsVal = currentFps
+                        DispatchQueue.main.async {
+                            self.image = img
+                            if fpsVal > 0 { self.fps = fpsVal }
+                            OSAtomicCompareAndSwap32(0, 1, &displayReady)
+                        }
                     }
+                }
             }
+          } // autoreleasepool (outer)
         }
     }
 }

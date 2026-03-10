@@ -57,6 +57,21 @@ public class GaussianTrainer {
         return PixelData(pixels: data, width: Int(buf.width), height: Int(buf.height))
     }
 
+    /// Zero-copy render from an arbitrary camera pose into a pre-allocated RGBA uint8 buffer.
+    /// For real-time display loops where allocation overhead matters.
+    ///
+    /// Pass `nil` for `rgba` to query dimensions without rendering (for buffer pre-allocation).
+    /// Buffer must hold at least `width × height × 4` bytes.
+    public func renderFromPoseToBuffer(camToWorld: [Float], refCameraIndex: Int = 0,
+                                       rgba: UnsafeMutablePointer<UInt8>?,
+                                       width: inout Int32, height: inout Int32) {
+        precondition(camToWorld.count == 16)
+        camToWorld.withUnsafeBufferPointer { ptr in
+            msplat_trainer_render_pose_to_buffer(handle, ptr.baseAddress!, Int32(refCameraIndex),
+                                                 rgba, &width, &height)
+        }
+    }
+
     /// Export scene as PLY.
     public func exportPly(to path: String) {
         msplat_trainer_export_ply(handle, path)
